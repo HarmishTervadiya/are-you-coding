@@ -5,6 +5,45 @@ import cron from "node-cron";
 
 const startContest = async () => {
   try {
+    const currentContestId = await redis.get(redisKeys.ACTIVE_CONTEST_ID_KEY);
+
+    if (currentContestId) {
+      const leaderboardKey = redisKeys.LEADERBOARD_KEY(currentContestId);
+
+      const rawLeaderboard = await redis.zrevrange(
+        leaderboardKey,
+        0,
+        -1,
+        "WITHSCORES",
+      );
+
+      const rankings = [];
+      for (let i = 0; i < rawLeaderboard.length; i += 2) {
+        rankings.push({
+          username: rawLeaderboard[i]!,
+          score: parseInt(rawLeaderboard[i + 1] || "0", 10),
+        });
+      }
+
+      const winner = rankings[0]?.username || "No Participant";
+      const endedAt = Date.now();
+      console.log(
+        `[cron] Archiving contest history for: ${currentContestId}. Winner: ${winner}`,
+      );
+
+      await redis.zadd("contest:history:index", endedAt, currentContestId);
+
+      await redis.hset(`contest:history:data:${currentContestId}`, {
+        contestId: currentContestId,
+        endedAt: String(endedAt),
+        winner: winner,
+        rankings: JSON.stringify(rankings),
+      });
+    }
+
+    // Drain the queue to clear delayed/waiting jobs from the previous contest
+    await activityQueue.drain(true);
+
     const contestNum = await redis.incr(redisKeys.TOTAL_CONTEST);
     const contestId = `contest_${contestNum}`;
     const leaderboardKey = redisKeys.LEADERBOARD_KEY(contestId);
@@ -25,6 +64,8 @@ const startContest = async () => {
       id: string;
       type: string;
       member: string;
+      repo: { name: string; url: string };
+      public: boolean;
       timestamp: number;
     }
 
@@ -36,6 +77,8 @@ const startContest = async () => {
           type: event.type,
           member: user.login,
           timestamp: new Date(event.created_at).getTime(),
+          public: event.public,
+          repo: event.repo,
         });
       });
     });
@@ -49,29 +92,33 @@ const startContest = async () => {
         const minTime = firstEvent.timestamp;
         const maxTime = lastEvent.timestamp;
         const timeSpan = maxTime - minTime || 1;
-        const contestDurationMs = 3 * 60 * 1000; 
+        const contestDurationMs = 3 * 60 * 1000;
 
-      console.log(`[cron] Scheduling ${allEvents.length} events over 3 minutes...`);
-
-      for (const event of allEvents) {
-        const relativeProgress = (event.timestamp - minTime) / timeSpan;
-        const delayMs = Math.round(relativeProgress * contestDurationMs);
-
-        await activityQueue.add(
-          event.id,
-          {
-            contestId,
-            type: event.type,
-            member: event.member,
-          },
-          {
-            delay: delayMs,
-            removeOnComplete: true,
-            removeOnFail: true,
-          }
+        console.log(
+          `[cron] Scheduling ${allEvents.length} events over 3 minutes...`,
         );
-      }
-      console.log(`[cron] Successfully scheduled all events for ${contestId}`);
+
+        for (const event of allEvents) {
+          const relativeProgress = (event.timestamp - minTime) / timeSpan;
+          const delayMs = Math.round(relativeProgress * contestDurationMs);
+
+          await activityQueue.add(
+            event.id,
+            {
+              contestId,
+              type: event.type,
+              member: event.member,
+            },
+            {
+              delay: delayMs,
+              removeOnComplete: true,
+              removeOnFail: true,
+            },
+          );
+        }
+        console.log(
+          `[cron] Successfully scheduled all events for ${contestId}`,
+        );
       }
     }
   } catch (error) {
@@ -86,6 +133,7 @@ const task = cron.schedule("*/3 * * * *", startContest, {
 
 console.log("[cron] Scheduled job to run every 3 minutes (*/3 * * * *).");
 console.log("[cron] Running once immediately on startup...");
+
 startContest().catch((err) => {
   console.error("[cron] Error running initial contest on startup:", err);
 });

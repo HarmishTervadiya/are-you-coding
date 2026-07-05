@@ -13,6 +13,12 @@ const worker = new Worker(
       return;
     }
 
+    const activeContestId = await redis.get(redisKeys.ACTIVE_CONTEST_ID_KEY);
+    if (contestId !== activeContestId) {
+      // Discard jobs from previous aborted/completed contests
+      return;
+    }
+
     let point = 0;
     switch (type) {
       case "PushEvent":
@@ -42,7 +48,29 @@ const worker = new Worker(
 
     const leaderboardKey = redisKeys.LEADERBOARD_KEY(contestId);
     await redis.zincrby(leaderboardKey, point, member);
-    console.log(`[Worker] Contest: ${contestId} | User: ${member} | Event: ${type} | Points: +${point}`);
+
+    const currentRankings = await redis.zrevrange(
+      leaderboardKey,
+      0,
+      9,
+      "WITHSCORES",
+    );
+
+    const rankingData: { name: string; score: string }[] = [];
+    currentRankings.map((rank, index) => {
+      if (index % 2 == 0 && index != currentRankings.length - 1) {
+        rankingData.push({ name: rank, score: currentRankings[index + 1]! });
+      }
+    });
+
+    await redis.publish(
+      redisKeys.LIVE_CHANNEL,
+      JSON.stringify({ event: job.data, currentRankings: rankingData }),
+    );
+
+    console.log(
+      `[Worker] Contest: ${contestId} | User: ${member} | Event: ${type} | Points: +${point}`,
+    );
   },
   {
     connection: { url: process.env.REDIS_URL! },
