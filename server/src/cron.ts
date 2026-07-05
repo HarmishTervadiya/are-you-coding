@@ -1,5 +1,6 @@
 import { redisKeys } from "./constants";
 import { DUMMY_USERS } from "./dummy_data";
+import { getActiveUsernames, getRecentPublicEvents } from "./github";
 import { activityQueue, redis } from "./redis";
 import cron from "node-cron";
 
@@ -44,6 +45,41 @@ const startContest = async () => {
     // Drain the queue to clear delayed/waiting jobs from the previous contest
     await activityQueue.drain(true);
 
+    let usernames: { login: string; id: number }[] = [];
+    let events: any[][] = [];
+    let usingFallback = false;
+
+    try {
+      const fetchedUsers = await getActiveUsernames(10);
+      usernames = fetchedUsers.map(u => ({ login: u.login, id: u.id }));
+      
+      events = await Promise.all(
+        usernames.map(async (user) => {
+          try {
+            return await getRecentPublicEvents(user.login, 7);
+          } catch (err) {
+            console.warn(`[cron] Failed to fetch events for ${user.login}, skipping:`, err);
+            return [];
+          }
+        })
+      );
+
+      // Check if all fetched users have zero events combined
+      const totalEventsCount = events.reduce((acc, curr) => acc + curr.length, 0);
+      if (totalEventsCount === 0) {
+        console.warn("[cron] Fetched users have zero public events combined. Falling back to dummy users to ensure active contest.");
+        usingFallback = true;
+      }
+    } catch (error) {
+      console.error("[cron] GitHub API error, falling back to dummy data:", error);
+      usingFallback = true;
+    }
+
+    if (usingFallback || usernames.length === 0) {
+      usernames = DUMMY_USERS.map(u => ({ login: u.login, id: u.id }));
+      events = DUMMY_USERS.map(u => u.events);
+    }
+
     const contestNum = await redis.incr(redisKeys.TOTAL_CONTEST);
     const contestId = `contest_${contestNum}`;
     const leaderboardKey = redisKeys.LEADERBOARD_KEY(contestId);
@@ -53,7 +89,7 @@ const startContest = async () => {
     await redis.set(redisKeys.ACTIVE_CONTEST_ID_KEY, contestId);
 
     const pipeline = redis.pipeline();
-    DUMMY_USERS.forEach((user) => {
+    usernames.forEach((user) => {
       pipeline.zadd(leaderboardKey, 0, user.login);
     });
 
@@ -70,18 +106,29 @@ const startContest = async () => {
     }
 
     const allEvents: FlattenedEvent[] = [];
-    DUMMY_USERS.forEach((user) => {
-      user.events.forEach((event) => {
-        allEvents.push({
-          id: event.id,
-          type: event.type,
-          member: user.login,
-          timestamp: new Date(event.created_at).getTime(),
-          public: event.public,
-          repo: event.repo,
+    usernames.forEach((user, index) => {
+      const userEvents = events[index];
+      if (userEvents) {
+        userEvents.forEach((event) => {
+          allEvents.push({
+            id: event.id,
+            type: event.type,
+            member: user.login,
+            timestamp: new Date(event.created_at).getTime(),
+            public: event.public,
+            repo: event.repo,
+          });
         });
-      });
+      }
     });
+
+    // Shuffle events randomly first to interleave events with identical timestamps (common in dummy data)
+    for (let i = allEvents.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const temp = allEvents[i]!;
+      allEvents[i] = allEvents[j]!;
+      allEvents[j] = temp;
+    }
 
     allEvents.sort((a, b) => a.timestamp - b.timestamp);
 
@@ -108,6 +155,9 @@ const startContest = async () => {
               contestId,
               type: event.type,
               member: event.member,
+              memberUrl: `https://github.com/${event.member}`,
+              repoName: event.repo.name,
+              repoUrl: `https://github.com/${event.repo.name}`,
             },
             {
               delay: delayMs,
