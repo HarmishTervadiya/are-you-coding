@@ -13,6 +13,12 @@ const worker = new Worker(
       return;
     }
 
+    const isFrozen = await redis.get(redisKeys.CONTEST_FROZEN_KEY);
+    if (isFrozen === "1") {
+      // Contest has ended/frozen, discard all remaining jobs immediately
+      return;
+    }
+
     const activeContestId = await redis.get(redisKeys.ACTIVE_CONTEST_ID_KEY);
     if (contestId !== activeContestId) {
       // Discard jobs from previous aborted/completed contests
@@ -56,12 +62,13 @@ const worker = new Worker(
       "WITHSCORES",
     );
 
-    const rankingData: { name: string; score: string }[] = [];
-    currentRankings.map((rank, index) => {
-      if (index % 2 == 0 && index != currentRankings.length - 1) {
-        rankingData.push({ name: rank, score: currentRankings[index + 1]! });
-      }
-    });
+    const rankingData: { username: string; score: number }[] = [];
+    for (let index = 0; index < currentRankings.length; index += 2) {
+      rankingData.push({
+        username: currentRankings[index]!,
+        score: parseInt(currentRankings[index + 1] || "0", 10),
+      });
+    }
 
     await redis.publish(
       redisKeys.LIVE_CHANNEL,

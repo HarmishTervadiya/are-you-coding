@@ -42,8 +42,19 @@ const startContest = async () => {
       });
     }
 
+    // Freeze contest to stop worker processing delayed jobs from previous contest
+    await redis.set(redisKeys.CONTEST_FROZEN_KEY, "1");
     // Drain the queue to clear delayed/waiting jobs from the previous contest
     await activityQueue.drain(true);
+
+    const waitDurationMs = 30000;
+    const waitStart = Date.now();
+
+    await redis.publish(
+      redisKeys.LIVE_CHANNEL,
+      JSON.stringify({ type: "STATE_CHANGE", state: "WAITING", durationMs: waitDurationMs })
+    );
+    console.log(`[cron] Entering WAITING state for ${waitDurationMs / 1000}s...`);
 
     let usernames: { login: string; id: number }[] = [];
     let events: any[][] = [];
@@ -84,9 +95,22 @@ const startContest = async () => {
     const contestId = `contest_${contestNum}`;
     const leaderboardKey = redisKeys.LEADERBOARD_KEY(contestId);
 
+    const waitElapsed = Date.now() - waitStart;
+    const remainingWait = waitDurationMs - waitElapsed;
+    if (remainingWait > 0) {
+      await new Promise(res => setTimeout(res, remainingWait));
+    }
+
+    const activeDurationMs = 150000; // 2.5 minutes
+    await redis.publish(
+      redisKeys.LIVE_CHANNEL,
+      JSON.stringify({ type: "STATE_CHANGE", state: "ACTIVE", durationMs: activeDurationMs })
+    );
+
     console.log(`[cron] Starting new contest: ${contestId}`);
 
     await redis.set(redisKeys.ACTIVE_CONTEST_ID_KEY, contestId);
+    await redis.del(redisKeys.CONTEST_FROZEN_KEY);
 
     const pipeline = redis.pipeline();
     usernames.forEach((user) => {
@@ -122,54 +146,35 @@ const startContest = async () => {
       }
     });
 
-    // Shuffle events randomly first to interleave events with identical timestamps (common in dummy data)
-    for (let i = allEvents.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const temp = allEvents[i]!;
-      allEvents[i] = allEvents[j]!;
-      allEvents[j] = temp;
-    }
-
-    allEvents.sort((a, b) => a.timestamp - b.timestamp);
-
     if (allEvents.length > 0) {
-      const firstEvent = allEvents[0];
-      const lastEvent = allEvents[allEvents.length - 1];
-      if (firstEvent && lastEvent) {
-        const minTime = firstEvent.timestamp;
-        const maxTime = lastEvent.timestamp;
-        const timeSpan = maxTime - minTime || 1;
-        const contestDurationMs = 3 * 60 * 1000;
+      console.log(
+        `[cron] Scheduling ${allEvents.length} events randomly over 2.5 minutes...`,
+      );
 
-        console.log(
-          `[cron] Scheduling ${allEvents.length} events over 3 minutes...`,
-        );
+      for (const event of allEvents) {
+        // Randomly distribute the events over the 2.5 minutes active duration
+        const delayMs = Math.floor(Math.random() * 150000);
 
-        for (const event of allEvents) {
-          const relativeProgress = (event.timestamp - minTime) / timeSpan;
-          const delayMs = Math.round(relativeProgress * contestDurationMs);
-
-          await activityQueue.add(
-            event.id,
-            {
-              contestId,
-              type: event.type,
-              member: event.member,
-              memberUrl: `https://github.com/${event.member}`,
-              repoName: event.repo.name,
-              repoUrl: `https://github.com/${event.repo.name}`,
-            },
-            {
-              delay: delayMs,
-              removeOnComplete: true,
-              removeOnFail: true,
-            },
-          );
-        }
-        console.log(
-          `[cron] Successfully scheduled all events for ${contestId}`,
+        await activityQueue.add(
+          event.id,
+          {
+            contestId,
+            type: event.type,
+            member: event.member,
+            memberUrl: `https://github.com/${event.member}`,
+            repoName: event.repo.name,
+            repoUrl: `https://github.com/${event.repo.name}`,
+          },
+          {
+            delay: delayMs,
+            removeOnComplete: true,
+            removeOnFail: true,
+          },
         );
       }
+      console.log(
+        `[cron] Successfully scheduled all events for ${contestId}`,
+      );
     }
   } catch (error) {
     console.error("[cron] Error starting contest:", error);
@@ -177,7 +182,7 @@ const startContest = async () => {
 };
 
 // Schedule job to run every 3 minutes
-const task = cron.schedule("*/3 * * * *", startContest, {
+const task = cron.schedule("*/9 * * * *", startContest, {
   timezone: "Asia/Kolkata",
 });
 

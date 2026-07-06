@@ -9,12 +9,15 @@ export interface Participant {
 }
 
 export interface LiveEvent {
+  id?: string;
   contestId: string;
   type: string;
   member: string;
   memberUrl: string;
   repoName: string;
   repoUrl: string;
+  count?: number;
+  timestamp?: number;
 }
 
 export interface HistoryContest {
@@ -31,8 +34,12 @@ export function useContest() {
   const [socketConnected, setSocketConnected] = useState(false);
   const [history, setHistory] = useState<HistoryContest[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  
+  const [contestState, setContestState] = useState<"WAITING" | "ACTIVE">("ACTIVE");
+  const [phaseEndTime, setPhaseEndTime] = useState<number | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
+  const contestStateRef = useRef<"WAITING" | "ACTIVE">("ACTIVE");
 
   const fetchActiveLeaderboard = async () => {
     try {
@@ -67,6 +74,41 @@ export function useContest() {
     fetchActiveLeaderboard();
     fetchHistory();
 
+    const buffer: { event: LiveEvent; currentRankings: Participant[] }[] = [];
+    let flushTimeout: any = null;
+
+    const flushBuffer = () => {
+      if (buffer.length === 0 || contestStateRef.current === "WAITING") return;
+
+      const latestRankings = buffer[buffer.length - 1]!.currentRankings;
+      const newEvents = buffer.map((b) => b.event).filter(Boolean);
+
+      if (newEvents.length > 0) {
+        setEventsFeed((prev) => {
+          const updated = [...prev];
+          
+          for (let i = 0; i < newEvents.length; i++) {
+            const ev = newEvents[i]!;
+            if (updated.length > 0 && updated[0].member === ev.member && updated[0].type === ev.type) {
+              updated[0] = { ...updated[0], count: (updated[0].count || 1) + 1 };
+            } else {
+              updated.unshift({ ...ev, id: Math.random().toString(36).substring(2, 9), count: 1 });
+            }
+          }
+          return updated.slice(0, 30);
+        });
+        
+        const latestEvent = newEvents[newEvents.length - 1]!;
+        setActiveContestId(latestEvent.contestId);
+      }
+
+      if (latestRankings && latestRankings.length > 0) {
+        setLeaderboard(latestRankings);
+      }
+
+      buffer.length = 0;
+    };
+
     const connectSocket = () => {
       if (socketRef.current?.connected) return;
 
@@ -78,7 +120,6 @@ export function useContest() {
 
       socket.on("connect", () => {
         setSocketConnected(true);
-        // Refresh leaderboard on reconnection to catch up
         fetchActiveLeaderboard();
       });
 
@@ -86,20 +127,44 @@ export function useContest() {
         setSocketConnected(false);
       });
 
-      socket.on("leaderboard_update", (data: { event: LiveEvent; currentRankings: Participant[] }) => {
-        if (data.event) {
-          // Update active contest ID if changed
-          setActiveContestId(data.event.contestId);
-          // Add event to feed, cap at 30 items
-          setEventsFeed((prev) => [data.event, ...prev].slice(0, 30));
+      socket.on("leaderboard_update", (data: any) => {
+        if (data.type === "STATE_CHANGE") {
+          setContestState(data.state);
+          contestStateRef.current = data.state;
+          setPhaseEndTime(Date.now() + data.durationMs);
+          
+          if (data.state === "WAITING") {
+            buffer.length = 0;
+            if (flushTimeout) {
+              clearTimeout(flushTimeout);
+              flushTimeout = null;
+            }
+            setActiveContestId(null);
+            setEventsFeed([]);
+            setLeaderboard([]);
+            fetchHistory();
+          } else if (data.state === "ACTIVE") {
+            fetchActiveLeaderboard();
+          }
+          return;
         }
-        if (data.currentRankings) {
-          setLeaderboard(data.currentRankings);
+
+        buffer.push(data);
+        if (!flushTimeout) {
+          flushTimeout = setTimeout(() => {
+            flushBuffer();
+            flushTimeout = null;
+          }, 300); // Batch updates every 300ms
         }
       });
     };
 
     const disconnectSocket = () => {
+      if (flushTimeout) {
+        clearTimeout(flushTimeout);
+        flushTimeout = null;
+      }
+      buffer.length = 0;
       if (socketRef.current) {
         socketRef.current.disconnect();
         socketRef.current = null;
@@ -107,20 +172,17 @@ export function useContest() {
       }
     };
 
-    // Handle Page Visibility Throttling (efficient-background-processing)
+    // Handle Page Visibility Throttling
     const handleVisibilityChange = () => {
       if (document.hidden) {
-        console.log("[useContest] Tab inactive. Disconnecting socket to conserve resources.");
         disconnectSocket();
       } else {
-        console.log("[useContest] Tab active. Reconnecting and refreshing state.");
         fetchActiveLeaderboard();
         fetchHistory();
         connectSocket();
       }
     };
 
-    // Connect initially if visible
     if (!document.hidden) {
       connectSocket();
     }
@@ -141,5 +203,7 @@ export function useContest() {
     history,
     historyLoading,
     refetchHistory: fetchHistory,
+    contestState,
+    phaseEndTime,
   };
 }

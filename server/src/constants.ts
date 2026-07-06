@@ -4,5 +4,6 @@ export const redisKeys = {
     LEADERBOARD_KEY: (contestId: string) => `contest:${contestId}:leaderboard`,
     HISTORY_KEY: "contest:history",
     TOTAL_CONTEST: "totalcontest",
-    LIVE_CHANNEL: "live_leaderboard"
+    LIVE_CHANNEL: "live_leaderboard",
+    CONTEST_FROZEN_KEY: "contest:frozen"
 }
